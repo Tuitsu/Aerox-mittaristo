@@ -9,15 +9,42 @@
 // GPIO35 on ESP32 = ADC1 channel 7
 #define FUEL_ADC_UNIT      ADC_UNIT_1
 #define FUEL_ADC_CHANNEL   ADC_CHANNEL_7
-#define FUEL_ADC_ATTEN     ADC_ATTEN_DB_12   // ~0-3.3V range
+#define FUEL_ADC_ATTEN     ADC_ATTEN_DB_2_5  // ~0-1.25V range, better low-end accuracy (max sender V ~0.97V)
 
 // Fuel level sensor voltage divider: Vcc -- R_FIXED -- (ADC node) -- SENDER -- GND
 // Sender is a variable resistor: ~1000 ohm = empty, ~100 ohm = full.
 // Adjust R_FIXED to match your actual circuit (same divider style as NTC sensor).
 #define FUEL_VCC            3.3f
 #define FUEL_R_FIXED        220.0f    // ohms, fixed pull-up resistor (match hardware)
-#define FUEL_RES_EMPTY       1000.0f  // ohms at empty
-#define FUEL_RES_FULL        100.0f   // ohms at full
+#define FUEL_TANK_LITERS     6.5f
+
+// Calibration table: sender resistance (ohms) vs. fuel (liters), resistance decreasing with fuel.
+typedef struct { float ohms; float liters; } fuel_point_t;
+static const fuel_point_t FUEL_TABLE[] = {
+    {91.0f, 0.0f},
+    {82.0f, 0.75f},
+    {57.0f, 1.75f},
+    {46.0f, 2.75f},
+    {39.0f, 3.75f},
+    {27.0f, 4.75f},
+    {5.5f,  5.75f},  // ADC floor (~78 mV at raw=0) reads ~5.3 ohm, so treat <=5.5 as full
+    {5.5f,  6.5f},
+};
+#define FUEL_TABLE_LEN (sizeof(FUEL_TABLE) / sizeof(FUEL_TABLE[0]))
+
+static float fuel_ohms_to_liters(float r)
+{
+    if (r >= FUEL_TABLE[0].ohms) return FUEL_TABLE[0].liters;
+    for (size_t i = 1; i < FUEL_TABLE_LEN; i++) {
+        if (r >= FUEL_TABLE[i].ohms) {
+            float span = FUEL_TABLE[i - 1].ohms - FUEL_TABLE[i].ohms;
+            if (span <= 0.0f) return FUEL_TABLE[i].liters;
+            float t = (FUEL_TABLE[i - 1].ohms - r) / span;
+            return FUEL_TABLE[i - 1].liters + t * (FUEL_TABLE[i].liters - FUEL_TABLE[i - 1].liters);
+        }
+    }
+    return FUEL_TANK_LITERS;  // below lowest resistance -> full
+}
 
 // Smoothing: exponential moving average applied to the computed percentage.
 #define FUEL_EMA_ALPHA       0.15f
@@ -97,8 +124,8 @@ esp_err_t fuel_sensor_read_percent(float *out_percent)
         }
         voltage = voltage_mv / 1000.0f;
     } else {
-        // Fallback: assume 12-bit ADC and approx 3.3V full-scale at 12dB atten
-        voltage = (raw / 4095.0f) * FUEL_VCC;
+        // Fallback: assume 12-bit ADC and approx 1.25V full-scale at 2.5dB atten
+        voltage = (raw / 4095.0f) * 1.25f;
     }
 
     if (voltage <= 0.001f || voltage >= (FUEL_VCC - 0.001f)) {
@@ -109,8 +136,10 @@ esp_err_t fuel_sensor_read_percent(float *out_percent)
     // Calculate sender resistance from divider: Vcc -- R_FIXED -- node(V) -- SENDER -- GND
     float r_sender = FUEL_R_FIXED * (voltage / (FUEL_VCC - voltage));
 
-    // Linear mapping: FUEL_RES_EMPTY -> 0%, FUEL_RES_FULL -> 100%
-    float raw_percent = (FUEL_RES_EMPTY - r_sender) / (FUEL_RES_EMPTY - FUEL_RES_FULL) * 100.0f;
+    ESP_LOGI(TAG, "raw=%d V=%.3f R_sender=%.1f ohm", raw, voltage, r_sender);
+
+    // Table interpolation: resistance -> liters -> percent of tank
+    float raw_percent = fuel_ohms_to_liters(r_sender) / FUEL_TANK_LITERS * 100.0f;
     if (raw_percent < 0.0f) raw_percent = 0.0f;
     if (raw_percent > 100.0f) raw_percent = 100.0f;
 
